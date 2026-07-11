@@ -133,13 +133,30 @@ Q4_RERANKER = {}
 async def lifespan(app: FastAPI):
     global Q4_DOCS, Q4_EMBEDDINGS, Q4_RERANKER
     try:
-        docs, embs, reranker = generate_q4(config.EMAIL)
+        # Load the REAL downloaded dataset (documents.csv/embeddings.json/reranker_scores.json)
+        # instead of regenerating it via the ported PRNG -- this removes any risk of the
+        # PRNG port silently drifting from the grader's actual data in the future.
+        import csv
+        docs = []
+        with open("documents.csv", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                row["year"] = int(row["year"])
+                docs.append(row)
+        embs = json.load(open("embeddings.json", encoding="utf-8"))
+        reranker = json.load(open("reranker_scores.json", encoding="utf-8"))
         Q4_DOCS = docs
-        Q4_EMBEDDINGS = {k: np.array(v, dtype=np.float32) for k, v in embs.items()}
+        Q4_EMBEDDINGS = {k: np.array(v, dtype=np.float64) for k, v in embs.items()}
         Q4_RERANKER = reranker
-        print(f"Q4 data generated for {config.EMAIL}: {len(Q4_DOCS)} docs.")
+        print(f"Q4 data loaded from files: {len(Q4_DOCS)} docs.")
     except Exception as e:
-        print(f"Failed to generate Q4 data: {e}")
+        print(f"Failed to load Q4 data, falling back to generator: {e}")
+        try:
+            docs, embs, reranker = generate_q4(config.EMAIL)
+            Q4_DOCS = docs
+            Q4_EMBEDDINGS = {k: np.array(v, dtype=np.float64) for k, v in embs.items()}
+            Q4_RERANKER = reranker
+        except Exception as e2:
+            print(f"Fallback generator also failed: {e2}")
     yield
 
 # ============================================================
@@ -196,6 +213,25 @@ def parse_json(s):
 async def root():
     return {"ok": True, "email": config.EMAIL}
 
+# ---- Debug capture (last request/response for each endpoint) ----
+_DEBUG = {"q3": None, "q4": None, "q5_extract": None, "q5_query": None, "q5_summary": None}
+
+@app.get("/debug-q3")
+def debug_q3():
+    return _DEBUG["q3"] or {"note": "no Q3 calls yet"}
+
+@app.get("/debug-q4")
+def debug_q4():
+    return _DEBUG["q4"] or {"note": "no Q4 calls yet"}
+
+@app.get("/debug-q5")
+def debug_q5():
+    return {
+        "extract_graph": _DEBUG["q5_extract"] or {"note": "no calls yet"},
+        "graph_query": _DEBUG["q5_query"] or {"note": "no calls yet"},
+        "community_summary": _DEBUG["q5_summary"] or {"note": "no calls yet"},
+    }
+
 # ================= Q3: /q3/answer =================
 @app.post("/grounded-answer")
 async def q3_answer(request: Request):
@@ -220,19 +256,25 @@ async def q3_answer(request: Request):
         f"CHUNKS:\n{json.dumps(chunks, indent=2)}"
     )
     try:
-        out = parse_json(await chat([{"role": "user", "content": prompt}], model="gpt-4o-mini", max_tokens=1000))
+        raw = await chat([{"role": "user", "content": prompt}], model="gpt-4o-mini", max_tokens=1000)
+        out = parse_json(raw)
         if not out.get("answerable", False) or out.get("confidence", 1.0) <= 0.3:
-            return {"answer": "I don't know", "citations": [], "confidence": 0.1, "answerable": False}
-        valid_ids = [c["chunk_id"] for c in chunks]
-        cites = [c for c in out.get("citations", []) if c in valid_ids]
-        return {
-            "answer": out.get("answer", "I don't know"),
-            "citations": cites,
-            "confidence": float(out.get("confidence", 0.9)),
-            "answerable": True
-        }
-    except Exception:
-        return {"answer": "I don't know", "citations": [], "confidence": 0.1, "answerable": False}
+            result = {"answer": "I don't know", "citations": [], "confidence": 0.1, "answerable": False}
+        else:
+            valid_ids = [c["chunk_id"] for c in chunks]
+            cites = [c for c in out.get("citations", []) if c in valid_ids]
+            result = {
+                "answer": out.get("answer", "I don't know"),
+                "citations": cites,
+                "confidence": float(out.get("confidence", 0.9)),
+                "answerable": True
+            }
+        _DEBUG["q3"] = {"request": body, "raw_llm": raw, "response": result}
+        return result
+    except Exception as e:
+        result = {"answer": "I don't know", "citations": [], "confidence": 0.1, "answerable": False}
+        _DEBUG["q3"] = {"request": body, "error": str(e), "response": result}
+        return result
 
 # ================= Q4: /vector-search =================
 def cosine_sim(a, b):
@@ -246,7 +288,7 @@ def cosine_sim(a, b):
 async def vector_search(request: Request):
     body = await request.json()
     query_id = body.get("query_id")
-    query_vector = np.array(body.get("query_vector", []), dtype=np.float32)
+    query_vector = np.array(body.get("query_vector", []), dtype=np.float64)
     top_k = body.get("top_k", 10)
     rerank_top_n = body.get("rerank_top_n", 3)
     filters = body.get("filter", {})
@@ -283,7 +325,14 @@ async def vector_search(request: Request):
     for doc in top_k_docs:
         doc["rerank_score"] = rerank_scores.get(doc["doc_id"], -999.0)
     top_k_docs.sort(key=lambda x: (-x["rerank_score"], x["doc_id"]))
-    return {"matches": [d["doc_id"] for d in top_k_docs[:rerank_top_n]]}
+    matches = [d["doc_id"] for d in top_k_docs[:rerank_top_n]]
+    _DEBUG["q4"] = {
+        "request": body,
+        "num_filtered": len(filtered_docs),
+        "top_k_docs_with_scores": top_k_docs,
+        "matches": matches,
+    }
+    return {"matches": matches}
 
 # ================= Q5: GraphRAG Endpoints =================
 @app.post("/extract-graph")
@@ -303,10 +352,15 @@ async def extract_graph(request: Request):
         f"TEXT:\n{text}"
     )
     try:
-        out = parse_json(await chat([{"role": "user", "content": prompt}], model="gpt-4o", max_tokens=1500))
-        return {"entities": out.get("entities", []), "relationships": out.get("relationships", [])}
-    except Exception:
-        return {"entities": [], "relationships": []}
+        raw = await chat([{"role": "user", "content": prompt}], model="gpt-4o", max_tokens=1500)
+        out = parse_json(raw)
+        result = {"entities": out.get("entities", []), "relationships": out.get("relationships", [])}
+        _DEBUG["q5_extract"] = {"request": body, "raw_llm": raw, "response": result}
+        return result
+    except Exception as e:
+        result = {"entities": [], "relationships": []}
+        _DEBUG["q5_extract"] = {"request": body, "error": str(e), "response": result}
+        return result
 
 @app.post("/graph-query")
 async def graph_query(request: Request):
@@ -327,11 +381,16 @@ async def graph_query(request: Request):
         f"GRAPH:\n{json.dumps(graph, indent=2)}"
     )
     try:
-        out = parse_json(await chat([{"role": "user", "content": prompt}], model="gpt-4o", max_tokens=1500))
+        raw = await chat([{"role": "user", "content": prompt}], model="gpt-4o", max_tokens=1500)
+        out = parse_json(raw)
         path = out.get("reasoning_path", [])
-        return {"answer": out.get("answer", ""), "reasoning_path": path, "hops": len(path) - 1 if path else 0}
-    except Exception:
-        return {"answer": "", "reasoning_path": [], "hops": 0}
+        result = {"answer": out.get("answer", ""), "reasoning_path": path, "hops": len(path) - 1 if path else 0}
+        _DEBUG["q5_query"] = {"request": body, "raw_llm": raw, "response": result}
+        return result
+    except Exception as e:
+        result = {"answer": "", "reasoning_path": [], "hops": 0}
+        _DEBUG["q5_query"] = {"request": body, "error": str(e), "response": result}
+        return result
 
 @app.post("/community-summary")
 async def community_summary(request: Request):
@@ -351,7 +410,12 @@ async def community_summary(request: Request):
         f"RELATIONSHIPS:\n{json.dumps(relationships, indent=2)}"
     )
     try:
-        out = parse_json(await chat([{"role": "user", "content": prompt}], model="gpt-4o", max_tokens=1500))
-        return {"community_id": community_id, "summary": out.get("summary", "")}
-    except Exception:
-        return {"community_id": community_id, "summary": ""}
+        raw = await chat([{"role": "user", "content": prompt}], model="gpt-4o", max_tokens=1500)
+        out = parse_json(raw)
+        result = {"community_id": community_id, "summary": out.get("summary", "")}
+        _DEBUG["q5_summary"] = {"request": body, "raw_llm": raw, "response": result}
+        return result
+    except Exception as e:
+        result = {"community_id": community_id, "summary": ""}
+        _DEBUG["q5_summary"] = {"request": body, "error": str(e), "response": result}
+        return result
